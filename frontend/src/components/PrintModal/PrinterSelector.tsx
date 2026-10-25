@@ -14,14 +14,7 @@ import {
 import { api, type PrinterStatus } from '../../api/client';
 import { getColorName } from '../../utils/colors';
 import { isGcodeCompatible } from '../../utils/printer';
-import {
-  normalizeColorForCompare,
-  colorsAreSimilar,
-  filamentTypesCompatible,
-  autoMatchFilament,
-  filterFilamentsByNozzle,
-  effectivePreferLowest,
-} from '../../utils/amsHelpers';
+import { filterFilamentsByNozzle } from '../../utils/amsHelpers';
 import type { PrinterSelectorProps, AssignmentMode } from './types';
 import type { PrinterMappingResult, PerPrinterConfig } from '../../hooks/useMultiPrinterFilamentMapping';
 import type { FilamentRequirement, LoadedFilament } from '../../hooks/useFilamentMapping';
@@ -97,43 +90,19 @@ function InlineMappingEditor({
     }
   };
 
-  // Compute current slot assignments
+  // Show the tray each slot is actually dispatched with. The hook matched this
+  // printer once, through the same matcher the single-printer panel and the
+  // scheduler use; re-matching here (without tray_info_idx, and without
+  // reserving trays already auto-picked for earlier slots) could draw one tray
+  // while another was sent.
+  const ftsActive = printerResult.status?.fila_switch?.installed === true;
+  const comparisonBySlot = new Map(printerResult.filamentComparison.map((c) => [c.slot_id, c]));
   const slotAssignments = filamentReqs.map((req) => {
-    const slotId = req.slot_id || 0;
-    const currentMapping = printerResult.config.manualMappings[slotId];
-
-    let loaded: LoadedFilament | undefined;
-    let isManual = false;
-
-    if (currentMapping !== undefined) {
-      loaded = printerResult.loadedFilaments.find((f) => f.globalTrayId === currentMapping);
-      isManual = true;
-    } else {
-      const usedTrayIds = new Set<number>(Object.values(printerResult.config.manualMappings));
-      const cachedSettings = queryClient.getQueryData<{ prefer_lowest_filament?: boolean }>(['settings']);
-      loaded = autoMatchFilament(
-        req,
-        printerResult.loadedFilaments,
-        usedTrayIds,
-        effectivePreferLowest(cachedSettings?.prefer_lowest_filament, printerResult.status?.ams_filament_backup),
-        printerResult.inventoryByTrayId,
-      ) as LoadedFilament | undefined;
-    }
-
-    // Determine status
-    let status: 'match' | 'type_only' | 'mismatch' = 'mismatch';
-    if (loaded) {
-      const typeMatch = filamentTypesCompatible(loaded.type, req.type);
-      const colorMatch =
-        normalizeColorForCompare(loaded.color) === normalizeColorForCompare(req.color) ||
-        colorsAreSimilar(loaded.color, req.color);
-
-      if (typeMatch && colorMatch) {
-        status = 'match';
-      } else if (typeMatch) {
-        status = 'type_only';
-      }
-    }
+    const comparison = comparisonBySlot.get(req.slot_id);
+    const loaded: LoadedFilament | undefined = comparison?.loaded;
+    const isManual = comparison?.isManual ?? false;
+    const status: 'match' | 'type_only' | 'mismatch' =
+      comparison?.status === 'match' || comparison?.status === 'type_only' ? comparison.status : 'mismatch';
 
     return { req, loaded, status, isManual };
   });
@@ -184,7 +153,8 @@ function InlineMappingEditor({
             <option value="" className="bg-bambu-dark text-bambu-gray">
               -- Select slot --
             </option>
-            {filterFilamentsByNozzle(printerResult.loadedFilaments, req.nozzle_id)
+            {/* FTS routes any slot to either extruder (#1162), so every tray is a valid pick. */}
+            {(ftsActive ? printerResult.loadedFilaments : filterFilamentsByNozzle(printerResult.loadedFilaments, req.nozzle_id))
               .map((f) => (
               <option key={f.globalTrayId} value={f.globalTrayId} className="bg-bambu-dark text-white">
                 {f.label}: {f.traySubBrands || f.type} ({f.colorName})

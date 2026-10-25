@@ -2698,3 +2698,117 @@ describe('PrintModal — override survives "Any model" -> "Specific Printer" (#3
     ]);
   });
 });
+
+describe('PrintModal — multi-printer fan-out maps each printer on its own AMS', () => {
+  const mockOnClose = vi.fn();
+
+  // Same production cache behaviour as the per-plate block above.
+  const render = (ui: React.ReactElement) => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    return rtlRender(
+      <QueryClientProvider client={queryClient}>
+        <BrowserRouter>
+          <AuthProvider>
+            <ThemeProvider>
+              <ToastProvider>{ui}</ToastProvider>
+            </ThemeProvider>
+          </AuthProvider>
+        </BrowserRouter>
+      </QueryClientProvider>,
+    );
+  };
+
+  const RED = { slot_id: 1, type: 'PLA', color: '#FF0000', tray_info_idx: '', used_grams: 20 };
+  const BLACK = { slot_id: 2, type: 'PLA', color: '#000000', tray_info_idx: '', used_grams: 20 };
+
+  // Three printers loaded differently. A global tray id only names a spool on
+  // the printer it was read from: tray 0 is red on the X1C and black on the P1S.
+  const AMS_BY_PRINTER: Record<string, Array<{ id: number; tray_type: string; tray_color: string }>> = {
+    '1': [
+      { id: 0, tray_type: 'PLA', tray_color: 'FF0000' },
+      { id: 1, tray_type: 'PLA', tray_color: '000000' },
+    ],
+    '2': [
+      { id: 0, tray_type: 'PLA', tray_color: '000000' },
+      { id: 1, tray_type: 'PLA', tray_color: 'FF0000' },
+    ],
+    '3': [
+      { id: 0, tray_type: 'PETG', tray_color: 'FFFFFF' },
+      { id: 1, tray_type: 'PETG', tray_color: 'FFFFFF' },
+      { id: 2, tray_type: 'PLA', tray_color: '000000' },
+      { id: 3, tray_type: 'PLA', tray_color: 'FF0000' },
+    ],
+  };
+
+  type Queued = { printer_id: number; ams_mapping?: number[] | null };
+  let queued: Queued[];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    queued = [];
+    server.use(
+      http.get('/api/v1/printers/', () => HttpResponse.json(mockPrinters)),
+      http.get('/api/v1/archives/:id/plates', () => HttpResponse.json({ is_multi_plate: false, plates: [] })),
+      http.get('/api/v1/archives/:id/filament-requirements', () => HttpResponse.json({ filaments: [RED, BLACK] })),
+      http.get('/api/v1/printers/:id/status', ({ params }) =>
+        HttpResponse.json({
+          connected: true,
+          state: 'IDLE',
+          ams: [{ id: 0, tray: AMS_BY_PRINTER[String(params.id)] ?? [] }],
+          vt_tray: [],
+        }),
+      ),
+      http.get('/api/v1/printers/:id/assignments', () => HttpResponse.json([])),
+      http.post('/api/v1/queue/', async ({ request }) => {
+        queued.push((await request.json()) as Queued);
+        return HttpResponse.json({ id: queued.length, status: 'pending' });
+      }),
+    );
+  });
+
+  const submit = async (user: ReturnType<typeof userEvent.setup>, expected: number) => {
+    await user.click(document.querySelector('button[type="submit"]') as HTMLElement);
+    await waitFor(() => expect(queued.length).toBe(expected));
+  };
+
+  it('does not hand the first printer\'s tray ids to the other printers', async () => {
+    const user = userEvent.setup();
+    render(<PrintModal mode="create" archiveId={1} archiveName="RedBlack.gcode.3mf" onClose={mockOnClose} />);
+
+    await waitFor(() => expect(screen.getByText('X1 Carbon')).toBeInTheDocument());
+    await user.click(screen.getByText('X1 Carbon'));
+    await user.click(screen.getByText('P1S'));
+    // Both printers must have been read before their mapping can be asserted.
+    await waitFor(() => expect(screen.getAllByText('(2/2 matched)')).toHaveLength(2));
+
+    await submit(user, 2);
+
+    const byPrinter = Object.fromEntries(queued.map((q) => [q.printer_id, q.ams_mapping]));
+    // X1C: red is tray 0, black is tray 1.
+    expect(byPrinter[1]).toEqual([0, 1]);
+    // P1S: the same colours sit the other way round. Reusing the X1C's [0, 1]
+    // would print the red part in black and the black part in red.
+    expect(byPrinter[2]).toEqual([1, 0]);
+  });
+
+  it('maps every printer of a larger fan-out, whichever one was picked first', async () => {
+    const user = userEvent.setup();
+    render(<PrintModal mode="create" archiveId={1} archiveName="RedBlack.gcode.3mf" onClose={mockOnClose} />);
+
+    await waitFor(() => expect(screen.getByText('A1 Mini')).toBeInTheDocument());
+    // Picked out of id order: the first pick used to become the reference printer.
+    await user.click(screen.getByText('A1 Mini'));
+    await user.click(screen.getByText('P1S'));
+    await user.click(screen.getByText('X1 Carbon'));
+    await waitFor(() => expect(screen.getAllByText('(2/2 matched)')).toHaveLength(3));
+
+    await submit(user, 3);
+
+    const byPrinter = Object.fromEntries(queued.map((q) => [q.printer_id, q.ams_mapping]));
+    expect(byPrinter[1]).toEqual([0, 1]);
+    expect(byPrinter[2]).toEqual([1, 0]);
+    expect(byPrinter[3]).toEqual([3, 2]);
+  });
+});

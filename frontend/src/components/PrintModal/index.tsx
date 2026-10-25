@@ -306,7 +306,9 @@ export function PrintModal({
 
   // Printer counts and effective printer for filament mapping
   const effectivePrinterCount = selectedPrinters.length;
-  // For filament mapping, use first selected printer (mapping applies to all)
+  // The printer the single-printer mapping panel is drawn against. Its mapping
+  // (`amsMapping`) is only ever sent to this printer: a fan-out across several
+  // printers maps each one on its own trays (see getMappingForPrinter).
   const effectivePrinterId = selectedPrinters.length > 0 ? selectedPrinters[0] : null;
 
   // Queries
@@ -715,7 +717,6 @@ export function PrintModal({
     selectedPrinters,
     printers,
     mappingFilamentReqs,
-    manualMappings,
     perPrinterConfigs,
     setPerPrinterConfigs,
     settings?.prefer_lowest_filament,
@@ -757,7 +758,11 @@ export function PrintModal({
   useEffect(() => {
     if (mode === 'edit-queue-item') {
       // For edit mode, clear mappings if printer selection or plate changed from initial
-      const printersChanged = JSON.stringify(selectedPrinters.sort()) !== JSON.stringify(initialPrinterIds.sort());
+      // Sort copies: sorting the state arrays in place would reorder the
+      // selection under React and change which printer is `effectivePrinterId`.
+      const printersChanged =
+        JSON.stringify([...selectedPrinters].sort((a, b) => a - b)) !==
+        JSON.stringify([...initialPrinterIds].sort((a, b) => a - b));
       if (printersChanged || selectedPlate !== initialPlateId) {
         setManualMappings({});
         setManualMappingsByPlate({});
@@ -909,12 +914,14 @@ export function PrintModal({
       if (plateId === null || selectedPrinters.length !== 1) return undefined;
       return perPlateAmsMappings.get(plateId);
     }
-    // For multi-printer selection, check if this printer has an override
+    // Several printers: each one gets the mapping matched on its own trays,
+    // custom or not. `amsMapping` belongs to the first selected printer, and a
+    // global tray id names a different spool (or no spool) on any other one —
+    // handing it down the fan-out printed printers 2..N in whatever their trays
+    // at those positions held, while the selector showed them as matched. The
+    // scheduler keeps a stored mapping verbatim, so nothing corrected it later.
     if (selectedPrinters.length > 1) {
-      const printerConfig = perPrinterConfigs[printerId];
-      if (printerConfig && !printerConfig.useDefault) {
-        return multiPrinterMapping.getFinalMapping(printerId);
-      }
+      return multiPrinterMapping.getFinalMapping(printerId);
     }
     return amsMapping;
   };
